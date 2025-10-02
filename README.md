@@ -14,3 +14,361 @@ git remote add origin https://github.com/SEU-USUARIO/site-lichinga.git
 git add .
 git commit -m "primeira versão do site de Lichinga"
 git push -u origin main
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <title>Registo Digital de Terrenos — Município de Lichinga (Protótipo)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw/dist/leaflet.draw.css" />
+  <style>
+    :root{--blue:#2563eb;--green:#16a34a;--orange:#d97706}
+    body{margin:0;font-family:system-ui,Arial,Helvetica,sans-serif;display:flex;flex-direction:column;height:100vh}
+    header{background:var(--blue);color:#fff;padding:1rem}
+    .container{display:flex;flex:1;overflow:hidden}
+    #map{flex:2;min-width:0}
+    #sidebar{flex:1;min-width:320px;background:#fff;border-left:1px solid #e5e7eb;padding:1rem;overflow:auto}
+    label{font-weight:600;font-size:0.9rem}
+    input,select,textarea{width:100%;padding:0.48rem;margin-top:0.3rem;margin-bottom:0.7rem;border:1px solid #d1d5db;border-radius:6px}
+    button{display:inline-block;padding:0.6rem 0.9rem;border-radius:6px;border:none;color:#fff;font-weight:700;cursor:pointer}
+    .btn-primary{background:var(--blue)}
+    .btn-success{background:var(--green)}
+    .btn-warning{background:var(--orange)}
+    .panel{background:#f8fafc;padding:0.6rem;border-radius:8px;margin-bottom:0.8rem}
+    .list-item{background:#fff;padding:0.6rem;border:1px solid #e6eefc;border-radius:6px;margin-bottom:0.5rem;display:flex;justify-content:space-between;align-items:center}
+    .small{font-size:0.85rem;color:#374151}
+    #gallery img{width:100%;border-radius:6px;margin-bottom:0.4rem}
+    .log{font-family:monospace;font-size:0.82rem;white-space:pre-wrap;max-height:160px;overflow:auto;background:#0f172a;color:#fff;padding:0.6rem;border-radius:6px}
+  </style>
+</head>
+<body>
+<header>
+  <h1>Registo Digital de Terrenos — Município de Lichinga (Protótipo)</h1>
+  <div class="small">Demo: monitoramento, anúncio, reserva/lock e transferência de parcelas (simulado)</div>
+</header>
+
+<div class="container">
+  <div id="map"></div>
+
+  <aside id="sidebar">
+    <div class="panel">
+      <label>Conta (simulada)</label>
+      <select id="userSelect"></select>
+      <div class="small">Troque o utilizador para simular diferentes papéis (cidadão, comprador, oficial).</div>
+    </div>
+
+    <div class="panel">
+      <label>Nome do proprietário (para salvar parcela)</label>
+      <input id="ownerName" placeholder="Ex: Maria de Lichinga" />
+
+      <button class="btn-success" id="saveParcelBtn">Salvar Parcela (se desenhada)</button>
+    </div>
+
+    <div class="panel">
+      <label>Anunciar parcela para venda</label>
+      <select id="parcelForSale"></select>
+      <input id="salePrice" placeholder="Preço (MT)" />
+      <button class="btn-primary" id="announceSaleBtn">Anunciar para venda</button>
+      <div class="small">A anunciação cria um anúncio ligado à parcela; um comprador pode reservar e pagar (simulado).</div>
+    </div>
+
+    <div class="panel">
+      <label>Mercado (anúncios ativos)</label>
+      <div id="marketList"></div>
+    </div>
+
+    <div class="panel">
+      <label>Parcelas salvas</label>
+      <div id="parcelsList"></div>
+    </div>
+
+    <div class="panel">
+      <label>Auditoria (registo de eventos)</label>
+      <div id="auditLog" class="log"></div>
+      <button class="btn-warning" id="clearAudit">Limpar (somente demo)</button>
+    </div>
+
+    <div id="gallery" class="panel">
+      <label>Galeria local - Lichinga</label>
+      <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/58/Lichinga_City_Hall.jpg/320px-Lichinga_City_Hall.jpg" alt="Prefeitura Lichinga" />
+      <img src="https://live.staticflickr.com/1461/25726140281_47212e9426_b.jpg" alt="Edifício Lichinga" />
+      <img src="https://live.staticflickr.com/65535/49613443232_8ba5bb7a74_b.jpg" alt="Paisagem" />
+    </div>
+  </aside>
+</div>
+
+<!-- libs -->
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw/dist/leaflet.draw.js"></script>
+<script src="https://unpkg.com/@turf/turf/turf.min.js"></script>
+
+<script>
+/* ===== Dados e helpers (localStorage – protótipo) ===== */
+const STORAGE_KEYS = {
+  PARCELS: 'lichinga_parcels_prod',
+  ADS: 'lichinga_ads_prod',
+  USERS: 'lichinga_users_prod',
+  AUDIT: 'lichinga_audit_prod'
+};
+
+function load(key, def){ try { return JSON.parse(localStorage.getItem(key)) || def; } catch(e){ return def; } }
+function save(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
+
+let parcels = load(STORAGE_KEYS.PARCELS, []);      // { uid, owner, geojson, area, forSale:bool, ownerId }
+let ads = load(STORAGE_KEYS.ADS, []);              // { adId, parcelUid, price, sellerId, status:'active'|'reserved'|'sold', reservedUntil, buyerId }
+let users = load(STORAGE_KEYS.USERS, [
+  { id: 'user:1', name:'Maria (proprietária)' },
+  { id: 'user:2', name:'João (comprador)' },
+  { id: 'official:1', name:'Oficial Municipal' },
+]);
+let audit = load(STORAGE_KEYS.AUDIT, []);
+
+// util UID
+function uid(prefix='U'){ return prefix + '-' + Date.now() + '-' + Math.floor(Math.random()*9000); }
+function logAudit(evt){
+  const item = { ts: new Date().toISOString(), evt };
+  audit.unshift(item);
+  save(STORAGE_KEYS.AUDIT, audit);
+  renderAudit();
+}
+
+/* ===== mapa e desenho ===== */
+const map = L.map('map').setView([-13.31278,35.24056],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'© OSM' }).addTo(map);
+
+const drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+
+const drawControl = new L.Control.Draw({
+  edit: { featureGroup: drawnItems, edit: true, remove: true },
+  draw: { polygon: true, polyline:false, rectangle:false, circle:false, marker:false, circlemarker:false }
+});
+map.addControl(drawControl);
+
+let latestDraft = null;
+
+map.on(L.Draw.Event.CREATED, function(e){
+  const layer = e.layer;
+  drawnItems.addLayer(layer);
+  const geo = layer.toGeoJSON();
+  const area = turf.area(geo);
+  latestDraft = { geojson: geo, area };
+  setStatus('Polígono desenhado. Área: ' + Math.round(area) + ' m²', 'ok');
+});
+
+map.on(L.Draw.Event.EDITED, function(e){
+  e.layers.eachLayer(layer => {
+    const geo = layer.toGeoJSON();
+    const area = turf.area(geo);
+    latestDraft = { geojson: geo, area };
+    setStatus('Polígono editado. Área: ' + Math.round(area) + ' m²', 'ok');
+  });
+});
+
+function redrawSavedParcels(){
+  // remove previous rendered layers
+  if(window._savedLayers) window._savedLayers.forEach(l=>map.removeLayer(l));
+  window._savedLayers = [];
+  parcels.forEach(p=>{
+    const coords = p.geojson.geometry.coordinates[0].map(([lng,lat])=>[lat,lng]);
+    const color = stringToColor(p.uid);
+    const poly = L.polygon(coords, {color, weight:2}).addTo(map);
+    poly.bindPopup(`<b>${p.uid}</b><br>Owner: ${p.owner}<br>${p.forSale ? '<i>À venda</i>' : ''}`);
+    window._savedLayers.push(poly);
+  });
+}
+
+/* ===== UI rendering ===== */
+function element(id){ return document.getElementById(id); }
+function setStatus(msg, type='info'){ /* optional: show somewhere */ console.log(msg); }
+
+function renderUsers(){
+  const sel = element('userSelect'); sel.innerHTML='';
+  users.forEach(u=>{
+    const opt = document.createElement('option'); opt.value=u.id; opt.textContent=u.name; sel.appendChild(opt);
+  });
+}
+function renderParcelsList(){
+  const div = element('parcelsList'); div.innerHTML='';
+  if(parcels.length===0){ div.innerHTML='<div class="small">Nenhuma parcela</div>'; return; }
+  parcels.forEach(p=>{
+    const el = document.createElement('div'); el.className='list-item';
+    el.innerHTML = `<div><strong>${p.uid}</strong><div class="small">${p.owner} • ${Math.round(p.area)} m²</div></div>`;
+    const right = document.createElement('div');
+    const ownerId = p.ownerId;
+    const btnSell = document.createElement('button'); btnSell.textContent='Anunciar'; btnSell.className='btn-primary'; btnSell.onclick=()=>prepareAnnounce(p.uid);
+    const btnTransfer = document.createElement('button'); btnTransfer.textContent='Transferir (sim)'; btnTransfer.style.marginLeft='6px'; btnTransfer.onclick=()=>forceTransfer(p.uid);
+    right.appendChild(btnSell); right.appendChild(btnTransfer);
+    el.appendChild(right);
+    div.appendChild(el);
+  });
+}
+
+function renderParcelSelectForSale(){
+  const sel = element('parcelForSale'); sel.innerHTML='';
+  const defaultOpt = document.createElement('option'); defaultOpt.value=''; defaultOpt.textContent='Escolha parcela...'; sel.appendChild(defaultOpt);
+  parcels.filter(p=>!p.forSale).forEach(p=>{
+    const opt = document.createElement('option'); opt.value=p.uid; opt.textContent = `${p.uid} — ${p.owner} • ${Math.round(p.area)} m²`; sel.appendChild(opt);
+  });
+}
+
+function renderMarket(){
+  const div = element('marketList'); div.innerHTML='';
+  const active = ads.filter(a=>a.status==='active' || a.status==='reserved');
+  if(active.length===0){ div.innerHTML='<div class="small">Sem anúncios ativos</div>'; return; }
+  active.forEach(a=>{
+    const p = parcels.find(x=>x.uid===a.parcelUid);
+    const el = document.createElement('div'); el.className='list-item';
+    const center = `<div><strong>${a.adId}</strong><div class="small">${p.uid} — ${p.owner}</div><div class="small">Preço: ${a.price} MT</div><div class="small">Status: ${a.status}${a.status==='reserved' ? ' (reservado até '+new Date(a.reservedUntil).toLocaleString()+')' : ''}</div></div>`;
+    el.innerHTML = center;
+    const right = document.createElement('div');
+    const buyBtn = document.createElement('button'); buyBtn.textContent='Reservar / Comprar'; buyBtn.className='btn-success';
+    buyBtn.onclick = ()=>reserveOrBuy(a.adId);
+    right.appendChild(buyBtn);
+    el.appendChild(right);
+    div.appendChild(el);
+  });
+}
+
+function renderAudit(){ renderAudit = function(){ /* placeholder overwritten below */ }; } // will be defined next
+
+/* ===== color from string ===== */
+function stringToColor(str){
+  let hash=0; for(let i=0;i<str.length;i++) hash = str.charCodeAt(i) + ((hash<<5)-hash);
+  const hue = Math.abs(hash)%360; return `hsl(${hue},70%,45%)`;
+}
+
+/* ===== actions: save parcel, announce sale, reserve/buy, transfer ===== */
+element('saveParcelBtn').onclick = ()=> {
+  const owner = element('ownerName').value.trim();
+  const userId = element('userSelect').value;
+  if(!latestDraft){ alert('Desenhe um polígono primeiro.'); return; }
+  if(!owner){ alert('Informe o nome do proprietário.'); return; }
+  // verify overlaps with existing parcels
+  for(const p of parcels){
+    try{
+      const inter = turf.intersect(latestDraft.geojson, p.geojson);
+      if(inter && turf.area(inter) > 0.01){ alert('Sobreposição detectada com parcela ' + p.uid); setStatus('sobreposição'); return; }
+    }catch(e){}
+  }
+  const id = uid('PAR');
+  const parcelObj = { uid:id, owner, ownerId:userId, geojson: latestDraft.geojson, area: latestDraft.area, forSale:false, created_at:new Date().toISOString() };
+  parcels.push(parcelObj); save(STORAGE_KEYS.PARCELS, parcels);
+  logAudit(`${users.find(u=>u.id===userId).name} salvou parcela ${id}`);
+  latestDraft = null;
+  redrawSavedParcels(); renderParcelsList(); renderParcelSelectForSale(); renderMarket();
+};
+
+function prepareAnnounce(parcelUid){
+  element('parcelForSale').value = parcelUid;
+  element('salePrice').value = '';
+  setStatus('Preencha preço e clique em Anunciar');
+}
+
+element('announceSaleBtn').onclick = ()=> {
+  const parcelUid = element('parcelForSale').value;
+  const price = parseFloat(element('salePrice').value);
+  const sellerId = element('userSelect').value;
+  if(!parcelUid){ alert('Escolha parcela'); return; }
+  if(isNaN(price) || price<=0){ alert('Preço inválido'); return; }
+  const p = parcels.find(x=>x.uid===parcelUid);
+  if(!p){ alert('Parcela não encontrada'); return; }
+  // only owner can announce
+  if(p.ownerId !== sellerId){ alert('Apenas o proprietário pode anunciar'); return; }
+  const adId = uid('AD');
+  const ad = { adId, parcelUid, price, sellerId, status:'active', created_at:new Date().toISOString() };
+  ads.push(ad); save(STORAGE_KEYS.ADS, ads);
+  p.forSale = true; save(STORAGE_KEYS.PARCELS, parcels);
+  logAudit(`${users.find(u=>u.id===sellerId).name} anunciou ${parcelUid} por ${price} MT (ad ${adId})`);
+  renderMarket(); renderParcelsList(); renderParcelSelectForSale(); redrawSavedParcels();
+};
+
+function reserveOrBuy(adId){
+  const userId = element('userSelect').value;
+  const ad = ads.find(a=>a.adId===adId);
+  if(!ad){ alert('Anúncio inválido'); return; }
+  if(ad.status==='sold'){ alert('Já vendido'); return; }
+  if(ad.status==='active'){
+    // reserve: set reservedUntil (10 minutes demo)
+    const reservedUntil = Date.now() + 10*60*1000;
+    ad.status='reserved'; ad.reservedUntil = reservedUntil; ad.buyerId = userId; save(STORAGE_KEYS.ADS, ads);
+    logAudit(`${users.find(u=>u.id===userId).name} reservou anúncio ${adId} até ${new Date(reservedUntil).toLocaleString()}`);
+    renderMarket();
+    alert('Reserva feita. Para completar, <simulação> o vendedor deve confirmar a transferência.');
+    return;
+  }
+  if(ad.status==='reserved'){
+    // if reserved by this user -> buy (simulate payment)
+    if(ad.buyerId !== userId){ alert('Anúncio já reservado por outro comprador'); return; }
+    // simulate payment and transfer
+    ad.status = 'sold'; ad.sold_at = new Date().toISOString(); save(STORAGE_KEYS.ADS, ads);
+    // transfer ownership
+    const parcel = parcels.find(p=>p.uid===ad.parcelUid);
+    const buyer = users.find(u=>u.id===userId);
+    const seller = users.find(u=>u.id===ad.sellerId);
+    const oldOwner = parcel.owner; parcel.owner = buyer.name; parcel.ownerId = buyer.id; parcel.forSale = false;
+    save(STORAGE_KEYS.PARCELS, parcels);
+    logAudit(`Transação concluída: ${buyer.name} comprou ${parcel.uid} de ${seller.name} por ${ad.price} MT (ad ${adId})`);
+    renderParcelsList(); renderMarket(); redrawSavedParcels();
+    alert('Compra simulada com sucesso. Protocolo registado no log de auditoria.');
+    return;
+  }
+}
+
+function forceTransfer(parcelUid){
+  // quick demo transfer (only for official)
+  const currentUser = users.find(u=>u.id===element('userSelect').value);
+  if(!currentUser.id.startsWith('official')){ if(!confirm('Transf. forçada: apenas oficial deve fazer isto — prosseguir?')===true) return;}
+  const newOwnerName = prompt('Nome do novo proprietário (simulação):');
+  if(!newOwnerName) return;
+  const p = parcels.find(x=>x.uid===parcelUid);
+  const old = p.owner;
+  p.owner = newOwnerName; p.forSale=false; save(STORAGE_KEYS.PARCELS, parcels);
+  logAudit(`${currentUser.name} forçou transferência de ${parcelUid} de ${old} para ${newOwnerName}`);
+  redrawSavedParcels(); renderParcelsList(); renderParcelSelectForSale();
+}
+
+/* ===== audit rendering and helpers ===== */
+function renderAudit(){
+  const out = element('auditLog');
+  out.textContent = audit.map(a=>`[${a.ts}] ${a.evt}`).join('\\n\\n');
+}
+element('clearAudit').onclick = ()=> {
+  if(!confirm('Limpar audit log (apenas demo)?')) return;
+  audit = []; save(STORAGE_KEYS.AUDIT, audit); renderAudit();
+};
+
+/* ===== periodic housekeeping: release expired reservations ===== */
+setInterval(()=>{
+  const now = Date.now();
+  let changed=false;
+  for(const a of ads){
+    if(a.status==='reserved' && a.reservedUntil && a.reservedUntil < now){
+      a.status='active'; delete a.reservedUntil; delete a.buyerId;
+      logAudit(`Reserva expirada: ad ${a.adId} voltou a active`);
+      changed=true;
+    }
+  }
+  if(changed){ save(STORAGE_KEYS.ADS, ads); renderMarket(); }
+}, 30*1000);
+
+/* ===== initialization ===== */
+function init(){
+  renderUsers();
+  renderParcelsList();
+  renderParcelSelectForSale();
+  renderMarket();
+  renderAudit();
+  redrawSavedParcels();
+}
+init();
+
+/* react to user change */
+element('userSelect').onchange = ()=> { /* placeholder for UI-permissions */ };
+
+/* ensure functions available in console for debugging */
+window._proto = { parcels, ads, users, audit, logAudit, uid };
+</script>
+</body>
+</html>
